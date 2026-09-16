@@ -1,0 +1,402 @@
+---
+title: "Multivariate models - early life cohort results"
+author: "Helen Fielding"
+format: html
+editor: source
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r Packages and functions}
+library(tidyverse)
+library(lme4)
+library(nlme)
+library(broom.mixed)
+#library(broom)
+library(kableExtra)
+library(survival)
+library(ggsurvfit)
+library(performance)
+
+theme_set(theme_minimal())
+
+# functions to do predictions from mixed models and mutate cond and multiplot
+source('functions.R')
+```
+
+```{r Load data and set colours}
+
+dat <- read_csv('coxph_death_publish.csv')%>%
+  mutate(across(.cols = c(sex, colour, diet_type2, imd_quintile), as.factor))
+
+dat$colour2 <- factor(dat$colour2, levels = c("black", "chocolate", "yellow"), labels = c("Black", "Chocolate", "Yellow"))
+dat$sex2 <- factor(dat$sex, levels = c("female", "male"), labels = c("Female", "Male"))
+
+#names(dat)
+# set colours
+sex_cols_n <- c(
+  male = "cornflowerblue",
+  female = "gold"
+)
+
+sex_cols_km <- c(
+  'sex=male' = "cornflowerblue",
+  'sex=female' = "gold"
+)
+
+```
+
+```{r Kaplan Meier null model for overall median survival}
+km_fit <- survfit(Surv(censor_age_days/365.25, status_death) ~ 1, data=dat)
+
+km_fit
+```
+
+```{r Fig 1 - surv curve KM by sex}
+
+km_fit_sex <- survfit(Surv(censor_age_days/365.25, status_death) ~ sex, data=dat%>%mutate(sex = forcats::fct_rev(sex)))
+
+km_fit_sex
+
+ggsurvfit(km_fit_sex, linewidth = 1)+xlab('Age (years)')+
+  add_quantile(y_value = 0.5, color = "gray50", linewidth = 0.75)+
+  labs(y = "Percentage Survival")+
+  add_confidence_interval()+
+  #add_risktable()+
+  scale_ggsurvfit()+
+  scale_colour_manual(values = sex_cols_km) +
+  scale_fill_manual(values = sex_cols_km) +
+  theme_minimal() +
+  theme(legend.position = c(0.9,0.9))
+
+
+#confint(final)
+```
+
+## Fit CPH weight model with tt()
+
+```{r Cox PH IPCW model}
+
+final <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + colour2 + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90 +
+      titbits + diet_type2 + diet_raw +
+      household_smoking_status + 
+      imd_cat
+      ,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),# estimates effect at 10 years
+      data = dat, weights = ipcw_stratified)
+summary(final)
+
+```
+
+```{r Model selection - Median neutering model}
+
+cox_median <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat, weights = ipcw_stratified)
+
+summary(cox_median)
+summary(cox_median)$concordance
+model_performance(cox_median)
+# BMI starts to be significant over 9 years of age up to 15
+# mean BMI is the bmi effect at 10 years - e.g. 1.006, 0.6% increase in hazard  per BMI unit at age 10 (as this is where we centred)
+# tt(mean_BMI) coefficient tells us how bmi changes with age - positive BMI effect gets stronger as dogs get older - not significant, weak evidence
+
+```
+
+```{r Model selection - 6 12 24 month cutoff models}
+
+cox_6m <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + gonad_exp_over6m +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat, weights = ipcw_stratified)
+
+summary(cox_6m)
+
+cox_12m <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + gonad_exp_over12m +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat, weights = ipcw_stratified)
+
+summary(cox_12m)
+
+cox_24m <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + gonad_exp_over24m +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat, weights = ipcw_stratified)
+
+summary(cox_24m)
+
+```
+
+```{r Model selection - Table 2 - compare neutering coefficients and AIC}
+
+tidy(cox_median, conf.int = T, exponentiate = T)%>%mutate(model = 'Median')%>%
+  bind_rows(tidy(cox_6m, conf.int = T, exponentiate = T)%>%mutate(model = '6m'))%>%
+  bind_rows(tidy(cox_12m, conf.int = T, exponentiate = T)%>%mutate(model = '12m'))%>%
+  bind_rows(tidy(cox_24m, conf.int = T, exponentiate = T)%>%mutate(model = '24m'))%>%
+  filter(grepl('gonad', term)|grepl('ovary', term))%>%
+  select(term, estimate, conf.low, conf.high, std.error)%>%
+  mutate(across(where(is.numeric), round, 3))%>%
+  mutate(Threshold = c(448,183, 365,730), .before = term)%>%
+  mutate(AIC = c(AIC(cox_median),AIC(cox_6m),AIC(cox_12m),AIC(cox_24m)),
+         `Delta AIC` = round(min(AIC) - AIC,2))%>%
+  mutate(`Estimate (95% CI)` = paste0(estimate, ' (', conf.low, '-', conf.high, ')'), 
+         .before = estimate)%>%
+  select(-term, -estimate, -conf.low, -conf.high)%>%
+  arrange(AIC)%>%
+  rename('Cutoff threshold (days)' = Threshold,
+         `Standard error` = std.error)
+
+```
+
+```{r Fig 2 all hazard ratios - data from run cox models script}
+
+hr_df_all <- read_csv('hazard_ratios_all_models_standardised_exp.csv')
+
+p <- hr_df_all%>%ggplot(aes(x = est_adj, y = Variable, xmin = conf.low_adj, xmax = conf.high_adj, colour = Model, #shape = sig,
+                           width = 0.3))+
+  geom_vline(aes(xintercept = 1), linetype = 'dashed')+
+  geom_point(position = position_dodge(width = 0.5), alpha = 0.9)+
+  geom_errorbar(position = position_dodge(width = 0.5))+
+  scale_x_continuous(breaks = seq(0.6, 1.8, 0.2), name = 'Hazard ratio (95% confidence intervals)')+
+  scale_color_manual(values = c("#0078bf" ,"#f7c612" ,"#a61f56" ,"#00843d", "#f08122", 'black'))+
+  coord_flip()+
+  theme(legend.position = 'bottom',
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r Table 3 and S1 hazard ratios}
+# cut and paste into excel (in code/outputs folder) and paste as picture in MS
+
+# tidy table
+hr_df_all %>%
+  mutate(`Hazard ratio (95% CI)` = paste0(est_adj, " (", conf.low_adj, "-", conf.high_adj, ")")) %>%
+  select(Model, Variable, `Hazard ratio (95% CI)`, `Standard error` = std.error, Statistic = statistic) %>%
+  pivot_wider(names_from = Model, values_from = c(`Hazard ratio (95% CI)`, `Standard error`, Statistic,),
+              names_glue = "{Model} { .value }") %>%
+  select(Variable,
+         starts_with("IPC"),
+         starts_with("Unweighted"))%>%
+  kable()%>%kable_classic(full_width = T)
+
+
+hr_df_all %>%
+  mutate(`Hazard ratio (95% CI)` = paste0(est_adj, " (", conf.low_adj, "-", conf.high_adj, ")")) %>%
+  select(Model, Variable, `Hazard ratio (95% CI)`, `Standard error` = std.error, Statistic = statistic) %>%
+  kable()%>%kable_classic(full_width = T)
+
+```
+
+```{r Fig 3 and table S2 - Median survival values - from sharing_calc_surv_curve_cox_ph_tt_sigvars.qmd}
+
+med_surv <- read_csv("cox_fit_ipcw_median_surv_profiles.csv")%>%
+  separate(name, into = c("sex", "gonad_exp", "bmi", "raw_diet"), sep = "_", convert = TRUE, remove = FALSE)
+
+med_surv%>%mutate(raw_diet = ifelse(raw_diet == 1, 'Raw', 'No raw'),
+                  gonad_exp = ifelse(gonad_exp == 'high', 'Gonad high', 'Gonad low'),
+                  name = paste(gonad_exp, raw_diet, sep = '\n'))%>%
+  rename(`Mean BMI` = bmi)%>%
+  ggplot(aes(x = name, y = median_survival_years, colour = sex))+
+  geom_point(position = position_dodge(width = 0.5))+
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, linewidth = 0.7, position = position_dodge(width = 0.5))+
+  scale_colour_manual(guide = 'none', name = '', values = sex_cols_n)+
+  scale_y_continuous(breaks = seq(11,15,0.2))+
+  facet_wrap(~`Mean BMI`, labeller = 'label_both')+
+  xlab('')+ylab('Median survival (years) 95% confidence intervals')+
+  theme_bw()
+
+#summary(med_surv$median_survival_years)
+
+med_surv%>%mutate(raw_diet = ifelse(raw_diet == 1, 'Raw', 'No raw'),
+                  gonad_exp = ifelse(gonad_exp == 'high', '>= 448 days', '< 448 days'))%>%
+  arrange(sex, gonad_exp, bmi, raw_diet)%>%
+  select(Sex = sex, `Gonad exposure` = gonad_exp, 
+         `Mean BMI` = bmi, `Raw diet` = raw_diet,
+         `Median survival in years (95% confidence intervals)` = median_survival)
+```
+
+```{r fig 4 BMI and fetch plot}
+
+qs <- data.frame(
+  x = quantile(dat$mean_bmi, c(0.1, 0.5, 0.9), na.rm = TRUE),
+  lab = c("10th percentile", 'Median', "90th percentile")
+)
+
+plot_bmi <- dat %>%
+  ggplot(aes(x = mean_bmi, fill = sex)) +
+  geom_histogram(position = position_dodge()) +
+  geom_vline(data = qs, aes(xintercept = x), linetype = "dashed") +
+  geom_text(data = qs, aes(x = x, y = Inf, label = lab), angle = 90, vjust = -0.4, hjust = 1.0, inherit.aes = FALSE)+
+  scale_fill_manual(values = sex_cols_n) +
+  xlab('Mean BMI @ 12-24 months')+
+  ylab('Number of dogs')+
+  theme(legend.position = 'bottom', legend.title = element_blank())
+
+qs1 <- data.frame(
+  x = quantile(dat$ex_fetch_mean_a, c(0.5, 0.9), na.rm = TRUE),
+  lab = c('Median', "90th percentile")
+)
+plot_ex <- dat %>%
+  ggplot(aes(x = ex_fetch_mean_a, fill = sex)) +
+  geom_histogram(position = position_dodge()) +
+  geom_vline(data = qs1, aes(xintercept = x), linetype = "dashed") +
+  geom_text(data = qs1, aes(x = x, y = Inf, label = lab), angle = 90, vjust = -0.4, hjust = 1.0, inherit.aes = FALSE)+
+  scale_fill_manual(values = sex_cols_n) +
+  xlab('Mean weekly fetch hours @ 12-24 months')+
+  ylab('Number of dogs')+
+  theme(legend.position = 'bottom', legend.title = element_blank())
+
+multiplot(plot_bmi, plot_ex, cols = 2)
+qs
+qs1
+quantile(dat$ex_fetch_mean_a, c(0,0.9,1), na.rm = TRUE)
+quantile(dat$ex_fetch_mean_p, c(0,0.9,1), na.rm = TRUE)
+```
+
+
+# Weight model ####
+```{r weight model and Table S3 estimates}
+# leave diet 
+mod <- glm(mean_weight ~ sex + colour + mean_height +
+              imd_quintile + ex_totalhpw_mean_a + diet_raw + diet_type2, 
+            data = dat)
+
+summary(mod)
+tidy(mod, conf.int = T)%>%mutate(across(where(is.numeric), ~round(.x, 2)))%>%
+  mutate(Estimate = paste0(estimate, ' (', conf.low, '-', conf.high, ')'))%>%
+  select(Variable = term, Estimate, `Standard error` = std.error, Statistic = statistic)%>%
+  kable()
+```
+
+```{r fig 5 weight Plot weight model}
+newdata6 <- expand_grid(
+  mean_height = seq(min(dat$mean_height, na.rm = TRUE),
+                    max(dat$mean_height, na.rm = TRUE),
+                    length.out = 100),
+  sex = levels(dat$sex),
+  colour = levels(dat$colour),
+  imd_quintile = factor(levels(dat$imd_quintile)[1],
+                        levels = levels(dat$imd_quintile)),
+  ex_totalhpw_mean_a = median(dat$ex_totalhpw_mean_a, na.rm = TRUE),
+  diet_raw = 0,
+  diet_type2 = factor(levels(dat$diet_type2)[1],
+                     levels = levels(dat$diet_type2))
+)
+# dry dog food
+pred6 <- predict(mod, newdata = newdata6,
+                 type = "response", se.fit = TRUE)
+
+newdata6a <- newdata6 %>%
+  mutate(pred_weight = pred6$fit,
+         lower = pred6$fit - 1.96 * pred6$se.fit,
+         upper = pred6$fit + 1.96 * pred6$se.fit)
+
+newdata_cutoff <- bind_rows(newdata6a%>%filter(sex == 'female')%>%
+                              filter(mean_height < dat%>%filter(sex == 'female')%>%pull(mean_height)%>%max() &
+                                       mean_height > dat%>%filter(sex == 'female')%>%pull(mean_height)%>%min()),
+                            newdata6a%>%filter(sex == 'male')%>%
+                              filter(mean_height < dat%>%filter(sex == 'male')%>%pull(mean_height)%>%max() &
+                                       mean_height > dat%>%filter(sex == 'male')%>%pull(mean_height)%>%min())
+                            )
+                            
+p <- ggplot(newdata_cutoff,
+       aes(x = mean_height, y = pred_weight,
+           colour = colour, fill = colour)) +
+  geom_point(data = dat,
+             aes(x = mean_height, y = mean_weight, colour = colour),
+             inherit.aes = FALSE, alpha = 0.5, size = 0.5) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(name = '', values = c('black', '#6A452E', '#CA4E33','gold'))+
+  scale_fill_manual(name = '', values = c('black', '#6A452E', '#CA4E33','gold'))+
+  facet_wrap(~sex) +
+  labs(x = "Mean height (cm)",
+       y = "Mean weight (kg)",
+       colour = "Colour",
+       fill = "Colour") +
+  theme_bw()+
+  theme(legend.position = 'bottom')
+p
+# fixed values
+newdata6 %>%
+  select(imd_quintile, ex_totalhpw_mean_a, diet_raw, diet_type2) %>%
+  distinct()
+
+```
+
+```{r Fig S1 functional form of BMI and age}
+
+t_seq <- seq(min(dat$censor_age_days[dat$censor_age_days > 0]), max(dat$censor_age_days), length.out = 100)
+time_fun <- log((t_seq / 365.25) / 10)
+
+coefs <- coef(final)[c("mean_bmi", "tt(mean_bmi)")]
+vcov_mat <- vcov(final)[c("mean_bmi", "tt(mean_bmi)"), c("mean_bmi", "tt(mean_bmi)")]
+
+logHR <- coefs["mean_bmi"] + coefs["tt(mean_bmi)"] * time_fun
+SE_logHR <- sqrt(vcov_mat["mean_bmi","mean_bmi"] + 2*vcov_mat["mean_bmi","tt(mean_bmi)"]*time_fun + vcov_mat["tt(mean_bmi)","tt(mean_bmi)"]*time_fun^2)
+
+df_plot <- data.frame(time_days=t_seq, time_years=t_seq/365.25, HR=exp(logHR), lower=exp(logHR - 1.96*SE_logHR), upper=exp(logHR + 1.96*SE_logHR))
+
+ggplot(df_plot, aes(x=time_years, y=HR)) +
+  geom_line(size=1.2) +
+  geom_ribbon(aes(ymin=lower, ymax=upper), alpha=0.2) +
+  geom_hline(yintercept=1, linetype="dashed") +
+  labs(x="Age (years)", y="Hazard ratio for mean BMI") +
+  theme_minimal(base_size=14)
+```
+
+```{r Fig S2 martingale residuals}
+
+mart <- residuals(final, type = "martingale")
+out <- dat%>%
+  mutate(status_death1 = as.factor(if_else(status_death == 0, 'Censored', 'Died')))
+out$martingale <- mart[seq_len(nrow(dat))]
+
+ggplot(out, aes(x = censor_age_days, y = martingale, colour = status_death1)) +
+  geom_point(alpha = 0.8, size = 0.5) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = "Age (days)",
+       y = "Martingale residual value") +
+  scale_color_discrete(name = '')+
+  theme_minimal()
+
+```
+
+```{r fig S3 weight bmi conversion}
+wp <- dat%>%#filter(mean_height > 50 & mean_height < 60)%>%
+  mutate(bmi_quantile = cut(mean_bmi,
+    breaks = unique(quantile(mean_bmi, probs = seq(0, 1, 1/3), na.rm = TRUE)),
+    include.lowest = TRUE, ordered_result = TRUE),
+    height_quantile = cut(mean_height,
+    breaks = unique(quantile(mean_height, probs = seq(0, 1, 1/3), na.rm = TRUE)),
+    include.lowest = TRUE, ordered_result = TRUE))%>%
+  ggplot()+
+  geom_boxplot(aes(x = bmi_quantile, y = mean_weight, fill = height_quantile))+
+  scale_y_continuous(breaks = seq(12,50,2), name = 'Mean weight (kg)')+
+  xlab('BMI quantile')+
+  scale_fill_discrete('Height quantile (cm)')+
+  coord_flip()+
+  facet_wrap(~sex, ncol = 1)+
+  theme(legend.position = 'bottom')
+wp
+```

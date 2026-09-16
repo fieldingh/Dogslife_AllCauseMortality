@@ -1,0 +1,253 @@
+---
+title: "Run multivariate models"
+author: "Helen Fielding"
+format: html
+editor: source
+---
+
+
+
+Author: Helen Fielding
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r Packages and functions and load data}
+library(tidyverse)
+library(lme4)
+library(broom.mixed)
+library(survival)
+library(ggsurvfit)
+
+theme_set(theme_minimal())
+
+# function to do predictions from mixed models and mutate cond
+source('functions.R')
+
+dat <- read_csv('coxph_death_publish.csv')%>%
+  mutate(across(.cols = c(sex, colour, diet_type2, imd_quintile), as.factor))
+
+```
+
+```{r cox12 tt mean bmi }
+cox12 <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),# estimates effect at 10 years
+      data = dat)
+
+summary(cox12)
+```
+
+Checking informative censoring
+
+We will now test the sensitivity of the informative censoring by constructing two scenarios;
+
+### 1. High risk model
+
+Non-administrative (LTFU) subjects are die the day of censoring.
+
+```{r Sensitivity of informative censoring - only LTFU}
+# dave collett book
+# high risk censoring - assume event occurs just after censoring
+
+dat_high_ltfu <- dat%>%mutate(status_death = ifelse(censor_status == 'ltfu', 1, status_death))# just change those not administrative censoring
+                         
+high_risk_mod_ltfu <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat_high_ltfu)
+
+summary(high_risk_mod_ltfu)
+```
+
+### 2. Low risk model
+
+Low risk censoring - LTFU censored subjects live as long as the longest living subject in the study (`r dat%>%filter(status_death == 1)%>%pull(censor_age_days)%>%max()` days).
+
+```{r low risk model - ltfu }
+max_surv <- dat%>%filter(status_death == 1)%>%pull(censor_age_days)%>%max()
+
+dat_low_ltfu <- dat%>%mutate_cond(status_death == 0 & censor_status == 'ltfu', censor_age_days = max_surv, status_death = 1)
+
+low_risk_mod_ltfu <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat_low_ltfu)
+
+summary(low_risk_mod_ltfu)
+```
+
+```{r Compare models}
+
+sig_vars_test <- tidy(cox12, conf.int = T, exponentiate = T)%>%mutate(model = 'normal')%>%
+  bind_rows(tidy(high_risk_mod_ltfu, conf.int = T, exponentiate = T)%>%mutate(model = 'high risk ltfu'))%>%
+  bind_rows(tidy(low_risk_mod_ltfu, conf.int = T, exponentiate = T)%>%mutate(model = 'low risk ltfu'))%>%
+  mutate(sig = p.value < 0.05)
+
+sig_vars_test%>%ggplot(aes(x = estimate, y = term, xmin = conf.low, xmax = conf.high, colour = model, shape = sig,
+                           width = 0.3))+
+  geom_vline(aes(xintercept = 1), linetype = 'dashed')+
+  geom_point(position = position_dodge(width = 0.5), alpha = 0.9)+
+  geom_errorbar(position = position_dodge(width = 0.5))+
+  coord_flip()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Some differences in estimates, suggestive of informative censoring - proceed with weighted model.
+
+## IPCW models 
+
+1.  Create a Cox PH with censoring as the response.
+
+```{r Inverse probability of (LTFU) censoring weight - Dave Collett book}
+
+dat%>%count(censor_status)
+dat_cens2 <- dat%>%mutate(status_censor = ifelse(censor_status == 'ltfu', 1,0))
+
+dat_cens2%>%count(status_death, status_censor)
+
+ipcw_weight <- coxph(Surv(censor_age_days, status_censor) ~ sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + 
+      exa_fetch_cat_90,
+                  data = dat_cens2)
+
+summary(ipcw_weight)
+cox.zph(ipcw_weight)
+
+# Step 2: Predicted probabilities
+sf_cens <- survfit(ipcw_weight, newdata = dat_cens2)
+# Extract survival at each person’s observed time
+# (probability of remaining uncensored)
+S_uncens_matrix <- summary(sf_cens, times = dat_cens2$censor_age_days, extend=TRUE)$surv
+S_uncens <- diag(S_uncens_matrix)
+# Step 3: Inverse probability weights
+# Inverse probability weights
+dat$ipw <- 1 / S_uncens
+hist(dat$ipw)
+
+
+```
+
+Household smoking status violates PH. try to stratify model on smoking.
+
+```{r Stratify model - take a while to run}
+censor1 <- coxph(Surv(censor_age_days, status_censor) ~ sex + strata(household_smoking_status) + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + 
+      exa_fetch_cat_90,
+                  data = dat_cens2)
+
+summary(censor1)
+cox.zph(censor1)
+dat_cens2 %>% count(household_smoking_status, status_censor)
+
+# Step 2: Predicted probabilities
+sf_cens <- survfit(censor1, newdata = dat_cens2)
+
+S_uncens <- vapply(seq_len(nrow(dat_cens2)), function(i) {
+  summary(sf_cens[i], times = dat_cens2$censor_age_days[i], extend = TRUE)$surv
+}, numeric(1))
+
+dat$ipcw_stratified1 <- 1 / S_uncens
+
+# no cap needed as not skewed
+
+summary(dat$ipcw_stratified)
+summary(dat$ipcw_stratified1)
+```
+
+## Fit the weighted Cox PH model.
+
+```{r Fit weighted model}
+# Step 4: Fit weighted Cox proportional hazards model
+fit_ipcw <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),# estimates effect at 10 years
+      data = dat, weights = ipcw_stratified)
+
+summary(fit_ipcw)
+```
+
+```{r Compare hazard ratios between all models}
+sig_vars_test <- tidy(cox12, conf.int = T, exponentiate = T)%>%mutate(model = 'Unweighted')%>%
+  bind_rows(tidy(fit_ipcw, conf.int = T, exponentiate = T)%>%mutate(model = 'IPCW'))%>%
+  bind_rows(tidy(high_risk_mod_ltfu, conf.int = T, exponentiate = T)%>%mutate(model = 'High risk'))%>%
+  bind_rows(tidy(low_risk_mod_ltfu, conf.int = T, exponentiate = T)%>%mutate(model = 'Low risk'))%>%
+  bind_rows(tidy(ipcw_weight, conf.int = T, exponentiate = T)%>%mutate(model = 'Censoring'))%>%
+  mutate(sig = p.value < 0.05)
+
+sig_vars_test%>%ggplot(aes(x = estimate, y = term, xmin = conf.low, xmax = conf.high, colour = model, #shape = sig,
+                           width = 0.3))+
+  geom_vline(aes(xintercept = 1), linetype = 'dashed')+
+  geom_point(position = position_dodge(width = 0.5), alpha = 0.9)+
+  geom_errorbar(position = position_dodge(width = 0.5))+
+  scale_x_continuous(breaks = seq(0.6, 1.8, 0.2))
+```
+
+```{r Merge standardised hazard ratios}
+
+cont_summary_values <- dat%>%
+  select(mean_bmi#, ex_fetch_mean_a
+         )%>%
+  gather(key, value)%>%
+  group_by(key)%>%
+  summarise_all(list(~mean(.), ~sd(.),
+                     q10 = ~quantile(., probs = c(0.10))[[1]],
+                     q90 = ~quantile(., probs = c(0.90))[[1]],
+                     ~min(.), ~max(.)))%>%
+  mutate(df10_90 = q90 -q10)%>%
+  select(key, sd, df10_90, q10, q90)
+
+hr_var_mapping <- read_delim(
+"Variable\tterm
+Sex: Male\tsexmale
+Colour: Chocolate\tcolour2chocolate
+Colour: Yellow\tcolour2yellow
+Gonadal exposure (<= 448 days)\tovary_explow
+Mean BMI in 2nd yr (at 10 yrs)\tmean_bmi
+Mean BMI in 2nd yr (over time)\ttt(mean_bmi)
+Extreme fetch in 2nd yr (>90th PC)\texa_fetch_cat_90
+Titbits given\ttitbits
+Dry food only\tdiet_type2dry_only
+Raw diet\tdiet_raw
+Smoking in household\thousehold_smoking_status
+IMD category 4-5\timd_cat",
+delim = "\t",
+show_col_types = FALSE)
+
+hr_df_all <-  tidy(cox12, conf.int = T, exponentiate = F)%>%mutate(Model = 'Unweighted')%>%
+  bind_rows(tidy(fit_ipcw, conf.int = T, exponentiate = F)%>%mutate(Model = 'IPCW'))%>%
+  bind_rows(tidy(high_risk_mod_ltfu, conf.int = T, exponentiate = F)%>%mutate(Model = 'High risk'))%>%
+  bind_rows(tidy(low_risk_mod_ltfu, conf.int = T, exponentiate = F)%>%mutate(Model = 'Low risk'))%>%
+  bind_rows(tidy(ipcw_weight, conf.int = T, exponentiate = F)%>%mutate(Model = 'Censoring'))%>%
+  mutate(term_short = case_when(
+  #grepl('ex_fetch_mean_a', term) ~ 'ex_fetch_mean_a',
+    grepl('mean_bmi', term) ~ 'mean_bmi',
+  .default = term))%>%
+  left_join(cont_summary_values, by = c('term_short' = 'key'))%>%
+  mutate(est_adj = ifelse(is.na(df10_90), estimate, estimate*df10_90),
+         conf.low_adj = ifelse(is.na(df10_90), conf.low, conf.low*df10_90),
+         conf.high_adj = ifelse(is.na(df10_90), conf.high, conf.high*df10_90))%>%
+  mutate(across(c(estimate, conf.low, conf.high, est_adj, conf.high_adj, conf.low_adj), exp))%>%
+  inner_join(hr_var_mapping, by = "term")%>%
+  mutate(across(where(is.numeric), round, 3))%>%
+  mutate(Model = factor(Model, levels = c("Unweighted", "IPCW", "subset", "High risk", "Low risk", "Censoring")))
+
+# Save out file for use in clean results script
+write_csv(hr_df_all, 'hazard_ratios_all_models_standardised_exp.csv')
+
+```

@@ -1,0 +1,288 @@
+---
+title: "Calculate survival curves"
+author: "Helen Fielding"
+format: html
+editor: source
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r Packages and functions and load data}
+
+library(tidyverse)
+library(survival)
+
+# function to do predictions from mixed models and mutate cond
+source('functions.R')
+
+dat <- read_csv('coxph_death_publish.csv')%>%
+  mutate(across(.cols = c(sex, colour, diet_type2, imd_quintile), as.factor))
+```
+
+## Fit weight model with tt()
+
+```{r model with weights}
+
+final <- coxph(Surv(censor_age_days, status_death) ~ 
+      sex + household_smoking_status + titbits + diet_type2 + diet_raw +
+      colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) +
+      exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),# estimates effect at 10 years
+      data = dat, weights = ipcw_stratified)
+summary(final)
+tidy(final, conf.int = T)
+```
+
+```{r Make new data}
+# black male and female, low and high bmi, low and high gonad exp, raw diet, yes and no
+
+newdata <- expand.grid(mean_bmi = c(round(quantile(dat$mean_bmi, probs = c(0.1,0.9))[[1]]),
+                         round(quantile(dat$mean_bmi, probs = c(0.1,0.9))[[2]])), 
+            sex = factor(c("male","female"), levels = levels(as.factor(dat$sex))),
+            ovary_exp =  factor(c('low', 'high'), levels = levels(as.factor(dat$ovary_exp))),
+            diet_raw = c(0,1))%>%
+  mutate(household_smoking_status = 0,
+                    imd_cat = 0,
+                    exa_fetch_cat_90 = 0,
+                    titbits = 1,
+                    diet_type2 = factor("dry_only", levels = levels(as.factor(dat$diet_type2))), 
+         colour2 = factor("black", levels = levels(as.factor(dat$colour2))),
+         name = paste(sex, ovary_exp, mean_bmi, diet_raw, sep = '_'))
+
+new_black <- newdata%>%slice(1)
+
+```
+
+### get median survival time and conf int
+
+```{r function}
+
+# Helper: estimate median survival from predicted survival curve
+# Uses linear interpolation around S(t) = 0.5 for a smoother estimate.
+get_median_surv_tt <- function(fit, dat, newdata_row, w = NULL, max_years = 20, step_days = 7) {
+  times <- seq(1, max_years * 365.25, by = step_days)
+  
+  surv <- if(is.null(w)) {
+    pred_surv_cox_tt(fit, dat, newdata_row, times)
+  } else {
+    pred_surv_cox_tt_wt(fit, dat, newdata_row, times, w = w)
+  }
+  
+  if(all(is.na(surv))) return(NA_real_)
+  if(all(surv > 0.5, na.rm = TRUE)) return(NA_real_)
+  
+  j <- which(surv <= 0.5)[1]
+  if(j == 1) return(times[j] / 365.25)
+  
+  # interpolate between the time just above and just below 0.5
+  t1 <- times[j - 1]; t2 <- times[j]
+  s1 <- surv[j - 1];  s2 <- surv[j]
+  
+  med_days <- t1 + (0.5 - s1) * (t2 - t1) / (s2 - s1)
+  med_days / 365.25
+}
+
+
+```
+
+```{r bootstrapping for conf int}
+set.seed(123)
+
+B <- 1 # should be 500- use 5 for testing
+max_years <- 20
+step_days <- 7
+
+# Point estimates from the final IPCW-weighted model
+median_point <- map_dbl(
+  seq_len(nrow(newdata)),
+  ~ get_median_surv_tt(
+    fit = final,
+    dat = dat,
+    newdata_row = newdata[.x, ],
+    w = dat$ipcw_stratified,
+    max_years = max_years,
+    step_days = step_days
+  )
+)
+
+# Bootstrap matrix: rows = bootstrap samples, columns = newdata profiles
+boot_med <- matrix(NA_real_, nrow = B, ncol = nrow(newdata))
+colnames(boot_med) <- newdata$name
+
+for(i in seq_len(B)) {
+  
+  message("Bootstrap ", i, " of ", B)
+  
+  idx <- sample(seq_len(nrow(dat)), replace = TRUE)
+  dat_b <- dat[idx, ]
+  
+  # 1. Refit censoring model for LTFU weights
+  dat_b$ltfu_event <- ifelse(dat_b$censor_status == "ltfu", 1, 0)
+  
+  cens_b <- try(
+    coxph(
+      Surv(censor_age_days, ltfu_event) ~ 
+        sex + household_smoking_status + titbits +
+        diet_type2 + diet_raw + colour2 + imd_cat + ovary_exp +
+        mean_bmi + exa_fetch_cat_90,
+      data = dat_b
+    ),
+    silent = TRUE
+  )
+  
+  if(inherits(cens_b, "try-error")) next
+  
+  sf_b <- try(survfit(cens_b, newdata = dat_b), silent = TRUE)
+  if(inherits(sf_b, "try-error")) next
+  
+  S_b <- try(summary(sf_b, times = dat_b$censor_age_days, extend = TRUE)$surv, silent = TRUE)
+  if(inherits(S_b, "try-error")) next
+  
+  dat_b$ipcw_stratified <- 1 / diag(S_b)
+  
+  
+  # 2. Refit weighted tt outcome model
+  fit_b <- try(
+    coxph(
+      Surv(censor_age_days, status_death) ~ 
+        sex + household_smoking_status + titbits +
+        diet_type2 + diet_raw + colour2 + imd_cat + ovary_exp +
+        mean_bmi + tt(mean_bmi) + exa_fetch_cat_90,
+      tt = function(x, t, ...) x * log((t / 365.25) / 10),
+      data = dat_b,
+      weights = ipcw_stratified
+    ),
+    silent = TRUE
+  )
+  
+  if(inherits(fit_b, "try-error")) next
+  
+  # 3. Estimate median survival for each profile
+  for(j in seq_len(nrow(newdata))) {
+    boot_med[i, j] <- tryCatch(
+      get_median_surv_tt(
+        fit = fit_b,
+        dat = dat_b,
+        newdata_row = newdata[j, ],
+        w = dat_b$ipcw_stratified,
+        max_years = max_years,
+        step_days = step_days
+      ),
+      error = function(e) NA_real_
+    )
+  }
+}
+```
+
+```{r summarise and save results}
+# NB if several profiles return NA, it means their predicted survival curve did not fall below 0.5 before max_years - so increase max years
+
+median_surv_ci <- tibble(
+  name = newdata$name,
+  median_survival_years = median_point,
+  lower = apply(boot_med, 2, quantile, 0.025, na.rm = TRUE),
+  upper = apply(boot_med, 2, quantile, 0.975, na.rm = TRUE),
+  n_boot_success = apply(!is.na(boot_med), 2, sum)
+) %>%
+  mutate(
+    across(c(median_survival_years, lower, upper), ~ round(.x, 2)),
+    median_survival = paste0(median_survival_years, " (", lower, "-", upper, ")")
+  )
+
+median_surv_ci
+
+median_surv_ci %>%
+  select(name, `Median survival, years (95% CI)` = median_survival) %>%
+  pivot_wider(
+    names_from = name,
+    values_from = `Median survival, years (95% CI)`
+  )
+
+write_csv(
+  median_surv_ci,
+  "cox_fit_ipcw_median_surv_profiles.csv"
+)
+```
+
+### get survival curve for tt model with weights
+
+```{r without conf int}
+#times <- c(5, 8,10,12,15) * 365.25
+#pred_no_weights <- pred_surv_cox_tt(final, dat, new_black, times) # not sure where this function is
+
+
+times <- c(5, 8,10,12,15) * 365.25
+pred_weights <- pred_surv_cox_tt_wt(final, dat, new_black, times, w = dat$ipcw_stratified)
+```
+
+```{r get conf int - accounting for weights LONG RUN, eval = F}
+set.seed(123)
+times <- c(5,8,10,12,15) * 365.25
+B <- 1 # use 1 for testing, 500 for output
+res <- data.frame()
+
+for(j in 1:nrow(newdata)){
+  
+  boot_mat <- matrix(NA, nrow=B, ncol=length(times))
+# TAKES A LONG TIME TO RUN - 2 HOURS?
+for(i in 1:B){
+  idx <- sample(seq_len(nrow(dat)), replace=TRUE)
+  dat_b <- dat[idx, ]
+
+  # 1. refit censoring model for LTFU weights
+  dat_b$ltfu_event <- ifelse(dat_b$censor_status == "ltfu", 1, 0)
+
+  cens_b <- coxph(
+    Surv(censor_age_days, ltfu_event) ~ sex + household_smoking_status + titbits +
+      diet_type2 + diet_raw + colour2 + imd_cat + ovary_exp +
+      mean_bmi + exa_fetch_cat_90,
+    data=dat_b
+  )
+
+  sf_b <- survfit(cens_b, newdata=dat_b)
+  S_b <- summary(sf_b, times=dat_b$censor_age_days, extend=TRUE)$surv
+  dat_b$ipcw_stratified <- 1 / diag(S_b)
+
+  
+  # 2. refit weighted tt outcome model
+  fit_b <- try(coxph(
+    Surv(censor_age_days, status_death) ~ sex + household_smoking_status + titbits +
+      diet_type2 + diet_raw + colour2 + imd_cat + ovary_exp +
+      mean_bmi + tt(mean_bmi) + exa_fetch_cat_90,
+    tt=function(x,t,...) x * log((t/365.25)/10),
+    data=dat_b,
+    weights=ipcw_stratified
+  ), silent=TRUE)
+
+  if(inherits(fit_b, "try-error")) next
+
+  # 3. predict survival for same profile
+  boot_mat[i,] <- pred_surv_cox_tt_wt(fit_b, dat_b, newdata[j,], times, w=dat_b$ipcw_stratified)
+}
+
+
+point <- pred_surv_cox_tt_wt(final, dat, newdata[j,], times, w=dat$ipcw_stratified)
+
+res <- res%>%bind_rows(data.frame(
+  name = newdata[j,]$name,
+  time_years = times/365.25,
+  survival = point,
+  lower = apply(boot_mat, 2, quantile, 0.025, na.rm=TRUE),
+  upper = apply(boot_mat, 2, quantile, 0.975, na.rm=TRUE)))
+  
+ print(res)
+}
+
+write_csv(res, 'cox_fit_ipcw_surv_pred_profiles.csv')
+
+# make presentable
+res%>%mutate(across(where(is.numeric), ~round(.x, 3)))%>%
+  mutate(death_probability = paste0(survival, ' (', lower, '-', upper, ')'))%>%
+  select(time_years, death_probability, name)%>%
+  pivot_wider(names_from = 'name', values_from = 'death_probability')
+
+
+```
